@@ -55,6 +55,7 @@ from multiprocessing import Process, freeze_support, Event
 _pin_project_root_first()
 
 import config as config_module
+from utils.deployment import uvicorn_proxy_options
 from config import APP_NAME, MAIN_SERVER_PORT, MEMORY_SERVER_PORT, TOOL_SERVER_PORT
 from utils import parent_guard, single_instance
 from utils.port_utils import (
@@ -1184,10 +1185,7 @@ def run_merged_servers() -> int:
         except Exception:
             pass
 
-    _behind_proxy = os.environ.get("NEKO_BEHIND_PROXY", "").strip().lower() in ("1", "true", "yes")
-    _proxy_kw: dict = {}
-    if _behind_proxy:
-        _proxy_kw = {"proxy_headers": True, "forwarded_allow_ips": "*"}
+    _proxy_kw = uvicorn_proxy_options()
 
     # 分步 import（控制峰值内存 & 提供进度反馈），逐段计时：三段 import 串行坐在
     # 端口就绪关键路径上，回归过一次没人发现（#1496 优化后被 openai 2.x 静默吃回
@@ -1433,15 +1431,13 @@ def run_memory_server(
 
         print(f"[Memory Server] Starting on port {MEMORY_SERVER_PORT}")
 
-        _behind_proxy = os.environ.get("NEKO_BEHIND_PROXY", "").strip().lower() in ("1", "true", "yes")
         # 使用 Server 对象，在启动后通知父进程
         config = uvicorn.Config(
             app=memory_server.app,
             host="127.0.0.1",
             port=MEMORY_SERVER_PORT,
             log_level="error",
-            proxy_headers=_behind_proxy,
-            forwarded_allow_ips="*" if _behind_proxy else None,
+            **uvicorn_proxy_options(),
         )
         server = uvicorn.Server(config)
         # uvicorn 在主线程运行时会覆盖 _apply_child_process_signal_policy 装好的
@@ -1457,7 +1453,7 @@ def run_memory_server(
                 shutdown_complete_event.set()
                 _teardown_print("[Memory Server] Shutdown lifecycle complete")
 
-            memory_server.app.add_event_handler("shutdown", _notify_shutdown_complete)
+            memory_server.app.router.add_event_handler("shutdown", _notify_shutdown_complete)
 
         # 组级信号（属主猝死、强制兜底）不走 launcher 的有序关闭，
         # 由本进程自己驱动 uvicorn 的优雅退出，保持释放/清理顺序。
@@ -1496,7 +1492,7 @@ def run_memory_server(
                 ready_event.set()
 
             # 将 startup 添加到服务器的启动事件
-            server.config.app.add_event_handler("startup", startup)
+            server.config.app.router.add_event_handler("startup", startup)
 
             # 运行服务器
             loop.run_until_complete(server.serve())
@@ -1550,14 +1546,12 @@ def run_agent_server(
         # Agent Server 不需要等待，立即通知就绪
         ready_event.set()
 
-        _behind_proxy = os.environ.get("NEKO_BEHIND_PROXY", "").strip().lower() in ("1", "true", "yes")
         config = uvicorn.Config(
             app=agent_server.app,
             host="127.0.0.1",
             port=TOOL_SERVER_PORT,
             log_level="error",
-            proxy_headers=_behind_proxy,
-            forwarded_allow_ips="*" if _behind_proxy else None,
+            **uvicorn_proxy_options(),
         )
         server = uvicorn.Server(config)
         # uvicorn 在主线程运行时会覆盖 _apply_child_process_signal_policy 装好的
@@ -1573,7 +1567,7 @@ def run_agent_server(
                 shutdown_complete_event.set()
                 _teardown_print("[Agent Server] Shutdown lifecycle complete")
 
-            agent_server.app.add_event_handler("shutdown", _notify_shutdown_complete)
+            agent_server.app.router.add_event_handler("shutdown", _notify_shutdown_complete)
 
         # 组级信号（属主猝死、强制兜底）不走 launcher 的有序关闭，
         # 由本进程自己驱动 uvicorn 的优雅退出，保持释放/清理顺序。
@@ -1629,7 +1623,6 @@ def run_main_server(
 
         print(f"[Main Server] Starting on port {MAIN_SERVER_PORT}")
 
-        _behind_proxy = os.environ.get("NEKO_BEHIND_PROXY", "").strip().lower() in ("1", "true", "yes")
         # 直接运行 FastAPI app，不依赖 main_server 的 __main__ 块
         config = uvicorn.Config(
             app=main_server.app,
@@ -1638,8 +1631,7 @@ def run_main_server(
             log_level="error",
             loop="asyncio",
             reload=False,
-            proxy_headers=_behind_proxy,
-            forwarded_allow_ips="*" if _behind_proxy else None,
+            **uvicorn_proxy_options(),
         )
         server = uvicorn.Server(config)
         # uvicorn 在主线程运行时会覆盖 _apply_child_process_signal_policy 装好的
@@ -1667,7 +1659,7 @@ def run_main_server(
                 shutdown_complete_event.set()
                 _teardown_print("[Main Server] Shutdown lifecycle complete")
 
-            main_server.app.add_event_handler("shutdown", _notify_shutdown_complete)
+            main_server.app.router.add_event_handler("shutdown", _notify_shutdown_complete)
 
         # 组级信号（属主猝死、强制兜底）不走 launcher 的有序关闭，
         # 由本进程自己驱动 uvicorn 的优雅退出，保持释放/清理顺序。
@@ -1693,7 +1685,7 @@ def run_main_server(
             ready_event.set()
 
         # 将 startup 添加到服务器的启动事件
-        main_server.app.add_event_handler("startup", startup)
+        main_server.app.router.add_event_handler("startup", startup)
 
         # 运行服务器
         server.run()

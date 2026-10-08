@@ -31,6 +31,8 @@ class AsrProviderPolicy:
     connect_max_attempts: int = 1
     connect_retry_base_seconds: float = 0.25
     connect_retry_cap_seconds: float = 1.0
+    observes_local_activity: bool = False
+    supports_result_preserving_finish: bool = False
 
     def __post_init__(self) -> None:
         if self.max_segment_ms is not None and self.max_segment_ms <= 0:
@@ -85,6 +87,7 @@ def resolve_provider_policy(
     )
     smart_turn_required = transport == "segmented" or endpoint_authority == "smart_turn"
     return AsrProviderPolicy(
+        observes_local_activity=(endpointing_mode == "provider" and meta.observes_local_activity),
         transport=transport,
         endpoint_authority=endpoint_authority,
         smart_turn_required=smart_turn_required,
@@ -97,4 +100,5 @@ def resolve_provider_policy(
         connect_max_attempts=meta.connect_max_attempts,
         connect_retry_base_seconds=meta.connect_retry_base_seconds,
         connect_retry_cap_seconds=meta.connect_retry_cap_seconds,
+        supports_result_preserving_finish=meta.supports_result_preserving_finish,
     )

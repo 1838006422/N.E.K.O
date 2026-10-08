@@ -7,6 +7,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from utils.config_manager import get_plugins_directory
+from utils.social_base import validate_http_url as _validate_http_url
 
 
 def _get_bool_env(name: str, default: bool) -> bool:
@@ -34,18 +35,6 @@ def _get_float_env(name: str, default: float) -> float:
         return float(value)
     except Exception:
         return default
-
-
-def _validate_http_url(value: str, *, name: str, allow_empty: bool = False) -> str:
-    value = value.strip()
-    if allow_empty and not value:
-        return value
-    parsed = urlparse(value)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise ValueError(f"{name} must be a valid http(s) URL")
-    if parsed.username or parsed.password:
-        raise ValueError(f"{name} must not include credentials")
-    return value
 
 
 def _validate_market_origin(origin: str) -> str:
@@ -109,7 +98,7 @@ def get_plugin_state_root() -> Path:
     return Path(get_plugins_directory()).resolve()
 
 
-def get_user_plugin_exec_root() -> Path:
+def get_user_plugin_exec_root(*, state_root: Path | None = None) -> Path:
     """Return the writable root for user-installed plugin code.
 
     An explicit legacy ``PLUGIN_CONFIG_ROOT`` override is still honoured as the
@@ -122,13 +111,13 @@ def get_user_plugin_exec_root() -> Path:
     if custom_path:
         return Path(custom_path).expanduser().resolve()
     return (
-        get_plugin_state_root().parent
+        (state_root if state_root is not None else get_plugin_state_root()).parent
         / ".neko-plugin-installations"
         / "plugins"
     ).resolve()
 
 
-def get_user_plugin_config_root() -> Path:
+def get_user_plugin_config_root(*, state_root: Path | None = None) -> Path:
     """Compatibility alias for the user plugin execution root.
 
     New code should use :func:`get_user_plugin_exec_root`. The old helper name
@@ -136,7 +125,7 @@ def get_user_plugin_config_root() -> Path:
     configuration/state.
     """
 
-    return get_user_plugin_exec_root()
+    return get_user_plugin_exec_root(state_root=state_root)
 
 
 def ensure_plugin_exec_state_roots_separated(
@@ -176,16 +165,16 @@ def get_plugin_config_root() -> Path:
     return BUILTIN_PLUGIN_CONFIG_ROOT
 
 
-def get_plugin_config_roots() -> tuple[Path, ...]:
+def get_plugin_config_roots(*, state_root: Path | None = None) -> tuple[Path, ...]:
     """Return executable plugin roots in effective-source priority order."""
     roots: list[Path] = []
-    for root in (get_user_plugin_exec_root(), get_builtin_plugin_config_root()):
+    for root in (get_user_plugin_exec_root(state_root=state_root), get_builtin_plugin_config_root()):
         if root not in roots:
             roots.append(root)
     return tuple(roots)
 
 
-def get_user_package_profiles_root() -> Path:
+def get_user_package_profiles_root(*, state_root: Path | None = None) -> Path:
     """获取用户插件包 profile 根目录。
 
     - Env: ``PACKAGE_PROFILES_ROOT``
@@ -202,10 +191,10 @@ def get_user_package_profiles_root() -> Path:
             Path(legacy_plugin_root).expanduser().resolve().parent
             / ".neko-package-profiles"
         ).resolve()
-    return (get_plugin_state_root().parent / ".neko-package-profiles").resolve()
+    return ((state_root if state_root is not None else get_plugin_state_root()).parent / ".neko-package-profiles").resolve()
 
 
-def get_user_plugin_packages_root() -> Path:
+def get_user_plugin_packages_root(*, state_root: Path | None = None) -> Path:
     """获取用户插件包（``.neko-plugin`` / ``.neko-bundle``）落地目录。
 
     - Env: ``PLUGIN_PACKAGES_ROOT``
@@ -222,18 +211,20 @@ def get_user_plugin_packages_root() -> Path:
             Path(legacy_plugin_root).expanduser().resolve().parent
             / ".neko-plugin-packages"
         ).resolve()
-    return (get_plugin_state_root().parent / ".neko-plugin-packages").resolve()
+    return ((state_root if state_root is not None else get_plugin_state_root()).parent / ".neko-plugin-packages").resolve()
 
 
+# Resolve one coherent set of default roots. Public helpers stay fresh outside
+# this scope, including after environment or storage-policy changes.
 BUILTIN_PLUGIN_CONFIG_ROOT = get_builtin_plugin_config_root()
 PLUGIN_STATE_ROOT = get_plugin_state_root()
-USER_PLUGIN_EXEC_ROOT = get_user_plugin_exec_root()
+USER_PLUGIN_EXEC_ROOT = get_user_plugin_exec_root(state_root=PLUGIN_STATE_ROOT)
 # Compatibility alias: historically this was both code and state. It now
 # deliberately names the execution root only.
 USER_PLUGIN_CONFIG_ROOT = USER_PLUGIN_EXEC_ROOT
-USER_PACKAGE_PROFILES_ROOT = get_user_package_profiles_root()
-USER_PLUGIN_PACKAGES_ROOT = get_user_plugin_packages_root()
-PLUGIN_CONFIG_ROOTS = get_plugin_config_roots()
+USER_PACKAGE_PROFILES_ROOT = get_user_package_profiles_root(state_root=PLUGIN_STATE_ROOT)
+USER_PLUGIN_PACKAGES_ROOT = get_user_plugin_packages_root(state_root=PLUGIN_STATE_ROOT)
+PLUGIN_CONFIG_ROOTS = get_plugin_config_roots(state_root=PLUGIN_STATE_ROOT)
 
 
 # ========== 队列容量配置 ==========
@@ -284,14 +275,46 @@ PLUGIN_TRIGGER_TIMEOUT = _get_float_env("NEKO_PLUGIN_TRIGGER_TIMEOUT", 10.0)
 # Env: NEKO_PLUGIN_STARTUP_TIMEOUT, default=10.0
 PLUGIN_STARTUP_TIMEOUT = _get_float_env("NEKO_PLUGIN_STARTUP_TIMEOUT", 10.0)
 
-# Keep the next-launch auto-start preference in sync with explicit user
-# start/stop actions from the plugin manager. Internal lifecycle operations do
-# not persist user intent and therefore do not change auto-start.
-# Env: NEKO_PLUGIN_SYNC_AUTO_START_ON_TOGGLE, default=True
+# Concurrent autostart limit for plugins without declared dependencies.
+# Dependents retain their topological startup order; 1 restores serial starts.
+# Bound resource contention and per-plugin startup timeouts on smaller machines.
+# Env: NEKO_PLUGIN_AUTOSTART_CONCURRENCY; default=min(8, max(2, cpu // 2)).
+PLUGIN_AUTOSTART_CONCURRENCY = _get_int_env(
+    "NEKO_PLUGIN_AUTOSTART_CONCURRENCY",
+    min(8, max(2, (os.cpu_count() or 4) // 2)),
+)
+
+# Legacy opt-in: also rewrite the next-launch auto-start preference on explicit
+# user start/stop actions from the plugin manager. Off by default -- a one-off
+# manual start/stop no longer changes auto-start; users set it with the
+# dedicated auto-start switch (PUT /plugin/{id}/auto-start). A manual stop then
+# persists nothing at all, since a stored enabled=false would also keep the
+# plugin from starting at the next launch. Internal lifecycle
+# operations never persist user intent regardless of this flag.
+# Env: NEKO_PLUGIN_SYNC_AUTO_START_ON_TOGGLE, default=False
 PLUGIN_SYNC_AUTO_START_ON_TOGGLE = _get_bool_env(
     "NEKO_PLUGIN_SYNC_AUTO_START_ON_TOGGLE",
-    True,
+    False,
 )
+
+# 插件源码热重载：监视插件目录的 ``*.py`` / ``plugin.toml`` 变更并自动 reload
+# 正在运行的插件（dev 模式注册的 source_dir 也在监视范围内）。默认关闭，
+# 主要供插件/本体开发使用；开启后每个变更的插件会经历一次 stop + start。
+# Env: NEKO_PLUGIN_HOT_RELOAD, default=False
+PLUGIN_HOT_RELOAD = _get_bool_env("NEKO_PLUGIN_HOT_RELOAD", False)
+
+# 热重载文件监视的轮询间隔（秒）
+# Env: NEKO_PLUGIN_HOT_RELOAD_INTERVAL, default=1.0
+PLUGIN_HOT_RELOAD_INTERVAL = _get_float_env("NEKO_PLUGIN_HOT_RELOAD_INTERVAL", 1.0)
+
+# 热重载防抖窗口（秒）：文件变更静默这么久后才真正触发 reload，
+# 避免编辑器多文件连写时 reload 到写了一半的代码。
+# Env: NEKO_PLUGIN_HOT_RELOAD_DEBOUNCE, default=1.5
+PLUGIN_HOT_RELOAD_DEBOUNCE = _get_float_env("NEKO_PLUGIN_HOT_RELOAD_DEBOUNCE", 1.5)
+
+# 轮询间隔的硬下限（非 env）。hot_reload_service 的最小 tick 也取这个值，
+# 保证「校验允许的最小间隔」与「实际休眠下限」不会各自漂移。
+PLUGIN_HOT_RELOAD_MIN_INTERVAL_SECONDS = 0.05
 
 # 单个插件优雅关闭的超时时间
 # Env: NEKO_PLUGIN_SHUTDOWN_TIMEOUT, default=1.5
@@ -740,6 +763,11 @@ def validate_config() -> None:
     if PLUGIN_STARTUP_TIMEOUT > 300:
         raise ValueError("PLUGIN_STARTUP_TIMEOUT is unreasonably large (max: 300s)")
 
+    if PLUGIN_AUTOSTART_CONCURRENCY < 1:
+        raise ValueError("PLUGIN_AUTOSTART_CONCURRENCY must be >= 1 (1 = serial)")
+    if PLUGIN_AUTOSTART_CONCURRENCY > 64:
+        raise ValueError("PLUGIN_AUTOSTART_CONCURRENCY is unreasonably large (max: 64)")
+
     if PLUGIN_SHUTDOWN_TIMEOUT <= 0:
         raise ValueError("PLUGIN_SHUTDOWN_TIMEOUT must be positive")
     if PLUGIN_SHUTDOWN_TIMEOUT > 300:
@@ -749,6 +777,14 @@ def validate_config() -> None:
         raise ValueError("PLUGIN_SHUTDOWN_TOTAL_TIMEOUT must be positive")
     if PLUGIN_SHUTDOWN_TOTAL_TIMEOUT > 300:
         raise ValueError("PLUGIN_SHUTDOWN_TOTAL_TIMEOUT is unreasonably large (max: 300s)")
+
+    if not math.isfinite(PLUGIN_HOT_RELOAD_INTERVAL) or not PLUGIN_HOT_RELOAD_MIN_INTERVAL_SECONDS <= PLUGIN_HOT_RELOAD_INTERVAL <= 60:
+        raise ValueError(
+            f"PLUGIN_HOT_RELOAD_INTERVAL must be in "
+            f"[{PLUGIN_HOT_RELOAD_MIN_INTERVAL_SECONDS}, 60] seconds"
+        )
+    if not math.isfinite(PLUGIN_HOT_RELOAD_DEBOUNCE) or not 0.0 <= PLUGIN_HOT_RELOAD_DEBOUNCE <= 60:
+        raise ValueError("PLUGIN_HOT_RELOAD_DEBOUNCE must be in [0, 60] seconds")
 
     if QUEUE_GET_TIMEOUT <= 0:
         raise ValueError("QUEUE_GET_TIMEOUT must be positive")
@@ -894,6 +930,9 @@ __all__ = [
     "PLUGIN_STARTUP_TIMEOUT",
     "PLUGIN_SHUTDOWN_TIMEOUT",
     "PLUGIN_SHUTDOWN_TOTAL_TIMEOUT",
+    "PLUGIN_HOT_RELOAD",
+    "PLUGIN_HOT_RELOAD_INTERVAL",
+    "PLUGIN_HOT_RELOAD_DEBOUNCE",
     "QUEUE_GET_TIMEOUT",
     "BUS_SDK_POLL_INTERVAL_SECONDS",
     "STATUS_CONSUMER_SHUTDOWN_TIMEOUT",
@@ -982,6 +1021,9 @@ PUBLIC_SYSTEM_CONFIG_KEYS = (
     "STATUS_CONSUMER_SHUTDOWN_TIMEOUT",
     "PROCESS_SHUTDOWN_TIMEOUT",
     "PROCESS_TERMINATE_TIMEOUT",
+    "PLUGIN_HOT_RELOAD",
+    "PLUGIN_HOT_RELOAD_INTERVAL",
+    "PLUGIN_HOT_RELOAD_DEBOUNCE",
     "COMMUNICATION_THREAD_POOL_MAX_WORKERS",
     "MESSAGE_QUEUE_DEFAULT_MAX_COUNT",
     "STATUS_MESSAGE_DEFAULT_MAX_COUNT",

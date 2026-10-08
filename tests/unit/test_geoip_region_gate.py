@@ -407,8 +407,8 @@ def test_startup_warmup_does_not_block_the_event_loop(monkeypatch):
 
     class _Hanging:
         def open(self, req, timeout=None):
-            release.wait(5)
-            raise OSError('timed out')
+            release.wait()
+            return _JsonResp('{"countryCode": "US"}')
 
     import urllib.request
     monkeypatch.setattr(urllib.request, 'build_opener', lambda *a, **kw: _Hanging())
@@ -421,28 +421,32 @@ def test_startup_warmup_does_not_block_the_event_loop(monkeypatch):
     ConfigManager._ensure_ip_probe_started()
 
     async def _run():
-        gaps = []
-        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        loop_thread = threading.get_ident()
+        join_entered = asyncio.Event()
+        original_join = probe.join_ip_probe
 
-        async def _beat():
-            last = real_time.monotonic()
-            while not stop.is_set():
-                await asyncio.sleep(0.02)
-                now = real_time.monotonic()
-                gaps.append(now - last)
-                last = now
+        def observed_join(*args):
+            assert threading.get_ident() != loop_thread, "probe wait ran on the event-loop thread"
+            loop.call_soon_threadsafe(join_entered.set)
+            # Start the real join budget only after the test releases the
+            # probe; scheduler delays cannot finish warming before that gate.
+            release.wait()
+            return original_join(*args)
 
-        beat = asyncio.create_task(_beat())
-        await asyncio.sleep(0.1)
-        release.set()
-        await probe.awarmup_region_check(timeout=5)
-        stop.set()
-        await beat
-        return max(gaps)
+        monkeypatch.setattr(probe, "join_ip_probe", observed_join)
+        warming = asyncio.create_task(probe.awarmup_region_check(timeout=5))
+        try:
+            # The loop must run while the real probe is still blocked. Unlike
+            # a heartbeat latency ceiling, this survives shared-runner load.
+            await asyncio.wait_for(join_entered.wait(), timeout=5)
+            assert not warming.done()
+        finally:
+            release.set()
+            assert await asyncio.wait_for(warming, timeout=5) is True
 
     try:
-        worst = asyncio.run(_run())
-        assert worst < 0.5, f'预热期间事件循环被占用 {worst:.2f}s'
+        asyncio.run(_run())
     finally:
         release.set()
 
@@ -1485,6 +1489,14 @@ def test_region_sensitive_voice_endpoints_settle_first():
             continue
         calls = {getattr(c.func, 'attr', None) or getattr(c.func, 'id', None)
                  for c in ast.walk(node) if isinstance(c, ast.Call)}
+        # 标准线程卸载仍是目录读取；仅识别 asyncio.to_thread 的直接首参。
+        calls.update(
+            getattr(c.args[0], 'attr', None) or getattr(c.args[0], 'id', None)
+            for c in ast.walk(node)
+            if isinstance(c, ast.Call) and c.args
+            and isinstance(c.func, ast.Attribute) and c.func.attr == 'to_thread'
+            and isinstance(c.func.value, ast.Name) and c.func.value.id == 'asyncio'
+        )
         if not (calls & readers):
             continue
         checked.append(node.name)
@@ -1493,6 +1505,23 @@ def test_region_sensitive_voice_endpoints_settle_first():
 
     assert len(checked) >= 2, f'未找到足够的音色目录端点，断言失效: {checked}'
     assert not missing, f'这些端点按区域出音色目录却未先落定: {missing}'
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize('endpoint', ['get_voices', 'get_voice_preview'])
+def test_voice_catalog_guard_rejects_removing_region_settlement(monkeypatch, endpoint):
+    """Both direct and to_thread readers remain guarded, rather than lowering the count."""
+    from pathlib import Path
+
+    source = Path(__file__).resolve().parents[2] / 'main_routers' / 'characters_router' / 'voice_preview.py'
+    original_read = Path.read_text
+    text = original_read(source, encoding='utf-8')
+    start = text.index(f'async def {endpoint}(')
+    mutant = text[:start] + text[start:].replace('aensure_region_resolved()', 'unrelated_readiness()', 1)
+    monkeypatch.setattr(Path, 'read_text', lambda path, *args, **kwargs:
+                        mutant if path == source else original_read(path, *args, **kwargs))
+    with pytest.raises(AssertionError, match=endpoint):
+        test_region_sensitive_voice_endpoints_settle_first()
 
 
 def _yui_binding_manager(authoritative_cfg, saved, probe_calls=None, non_mainland=False):
